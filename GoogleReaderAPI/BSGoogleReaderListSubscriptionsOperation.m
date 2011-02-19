@@ -7,10 +7,10 @@
 //  http://basil-salad.com
 
 #import "BSGoogleReaderListSubscriptionsOperation.h"
-#import <math.h>
 #import "ASIHTTPRequest.h"
 #import "ASIFormDataRequest.h"
 #import "CJSONDeserializer.h"
+#import "BSErrors.h"
 
 #import "FoundationAdditionsMacros.h"
 
@@ -33,18 +33,25 @@ NSString* const BSGoogleReaderFeedKey = @"com.basilsalad.BSGoogleReaderFeedKey";
 @synthesize password;
 
 -(void) performOperation {
-    // login
+    NSString* const USER_AGENT_KEY = @"User-Agent";
+    NSString* const USER_AGENT_VALUE = @"Mozilla/5.0 (Macintosh; U; Intel Mac OS X 10_6_4; en-us) AppleWebKit/533.19.4 (KHTML, like Gecko) Version/5.0.3 Safari/533.19.4";
+    //
+    // Step 1 - login
     NSURL* loginURL = [NSURL URLWithString:@"https://www.google.com/accounts/ClientLogin"];
     ASIFormDataRequest* loginRequest = [ASIFormDataRequest requestWithURL:loginURL];
+    loginRequest.useCookiePersistence = NO;
+    
+    [loginRequest addRequestHeader:USER_AGENT_KEY value:USER_AGENT_VALUE];
     
     [loginRequest setPostValue:@"reader" forKey:@"service"];
     [loginRequest setPostValue:@"scroll" forKey:@"source"];
     [loginRequest setPostValue:@"http://www.google.com/" forKey:@"continue"];
-
+    
     [loginRequest setPostValue:self.login forKey:@"Email"];
     [loginRequest setPostValue:self.password forKey:@"Passwd"];
+    
     [loginRequest startSynchronous];
-   
+    
     NSError* loginError = [loginRequest error];
     if (loginError) {
         self.operationError = loginError;
@@ -53,45 +60,67 @@ NSString* const BSGoogleReaderFeedKey = @"com.basilsalad.BSGoogleReaderFeedKey";
     
     NSString* loginResponse = [loginRequest responseString];
     NSArray* loginResponseVariables = [loginResponse componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
-    NSString* clientToken = nil;
+    NSString* clientSID = nil;
     NSString* errorMessage = nil;
+    NSString* clientAuth = nil;
     for(NSString* entry in loginResponseVariables) {
         NSArray* entryComponents = [entry componentsSeparatedByString:@"="];
         if (entryComponents.count == 2) {
             NSString* key = [entryComponents objectAtIndex:0];
             if ([@"SID" caseInsensitiveCompare:key] == NSOrderedSame) {
-                clientToken = [entryComponents objectAtIndex:1];
-                break;
+                clientSID = [entryComponents objectAtIndex:1];
+            } else if ([@"Auth" caseInsensitiveCompare:key] == NSOrderedSame) {
+                clientAuth = [entryComponents objectAtIndex:1];
             } else if ([@"Error" caseInsensitiveCompare:key] == NSOrderedSame) {
                 errorMessage = [entryComponents objectAtIndex:1];
-                break;
             }
         }
     }
     
-    if (!clientToken) {
+    
+    if (!clientSID || !clientAuth) {
         // return error
-        ErrorLog(@"Token not found - incorrect password? ErrorMessage: %@",errorMessage);
+        NSMutableDictionary* errorInfo = [NSMutableDictionary dictionaryWithCapacity:3];
+        ErrorLog(@"Error logging in. Response body:\n-----\n%@\n-----\n",loginResponse);
+        
+        [errorInfo setObject:NSLocalizedString(@"Could not log you in to Google.",@"Google Reader service") forKey:NSLocalizedDescriptionKey];
+        
+        if (errorMessage) {
+            [errorInfo setObject:[NSString localizedStringWithFormat:@"Google returned error: \"%@\".",errorMessage] forKey:NSLocalizedFailureReasonErrorKey];
+        }
+        [errorInfo setObject:NSLocalizedString(@"Please re-check your Google ID and password.",@"Google Reader service") forKey:NSLocalizedRecoverySuggestionErrorKey];
+        
+        self.operationError = [NSError errorWithDomain:BSCommonsErrorDomain code:BSInvalidCredentialsError userInfo:errorInfo];
         return;
     }
-    /*
-    NSDictionary* clientTokenCookieProperties = [NSDictionary dictionaryWithObjectsAndKeys:
-                                                 //@"1",NSHTTPCookieVersion,
-                                                 @".google.com",NSHTTPCookieDomain,
-                                                 @"1600000000",NSHTTPCookieMaximumAge,
-                                                 @"/",NSHTTPCookiePath,
-                                                 @"SID",NSHTTPCookieName,
-                                                 clientToken,NSHTTPCookieValue,
-                                                 nil];
-    NSHTTPCookie* clientTokenCookie = [NSHTTPCookie cookieWithProperties:clientTokenCookieProperties];
-     */
-    u_int64_t now = abs(round([[NSDate date] timeIntervalSince1970] * 1000));
     
+    NSDate* expiryDate = [NSDate dateWithTimeIntervalSinceNow:3600 * 24 * 7];
+    
+    NSDictionary* clientSidCookieProps = [NSDictionary dictionaryWithObjectsAndKeys:
+                                          @"0",NSHTTPCookieVersion,
+                                          @"/",NSHTTPCookiePath,
+                                          @".google.com",NSHTTPCookieDomain,
+                                          expiryDate,NSHTTPCookieExpires,
+                                          @"SID",NSHTTPCookieName,
+                                          clientSID,NSHTTPCookieValue,
+                                          nil];
+    
+    NSHTTPCookie* sidCookie = [NSHTTPCookie cookieWithProperties:clientSidCookieProps];
+    
+    //
+    // Step 2 - retrieve feed list.
+    u_int64_t now = abs(round([[NSDate date] timeIntervalSince1970] * 1000));
     NSURL* listURL = [NSURL URLWithString:[NSString stringWithFormat:@"http://www.google.com/reader/api/0/subscription/list?output=json&client=scroll&ck=%qu",now]];
     
+    NSString* authString = [NSString stringWithFormat:@"GoogleLogin auth=%@",clientAuth];
     
     ASIHTTPRequest* listRequest = [ASIHTTPRequest requestWithURL:listURL];
-    //listRequest.requestCookies = [NSMutableArray arrayWithObject:clientTokenCookie];
+    listRequest.useCookiePersistence = NO;
+    [loginRequest addRequestHeader:USER_AGENT_KEY value:USER_AGENT_VALUE];
+    [listRequest addRequestHeader:@"Authorization" value:authString];
+    
+    [listRequest.requestCookies addObject:sidCookie];
+    
     [listRequest startSynchronous];
     
     NSError* listError = [listRequest error];
@@ -108,20 +137,47 @@ NSString* const BSGoogleReaderFeedKey = @"com.basilsalad.BSGoogleReaderFeedKey";
     NSError* jsonError = nil;    
     NSDictionary* listData = [json deserializeAsDictionary:[listRequest responseData] error:&jsonError];
     if (![listData isKindOfClass:DICTIONARY_CLASS]) {
-        self.operationError = jsonError;
+        
+        if (jsonError) {
+            self.operationError = jsonError;
+        } else {
+            NSString* localizedFailureReason = [NSString localizedStringWithFormat:@"Google Reader doesn't return a dictionary for its root object but instead returned %@",[listData class]];
+            ErrorLog(@"%@",localizedFailureReason);
+            NSMutableDictionary* errorInfo = [NSMutableDictionary dictionaryWithCapacity:3];
+            
+            [errorInfo setObject:NSLocalizedString(@"Unknown data returned from Google Reader",@"Google Reader service") forKey:NSLocalizedDescriptionKey];
+            [errorInfo setObject:localizedFailureReason forKey:NSLocalizedFailureReasonErrorKey];
+            [errorInfo setObject:NSLocalizedString(@"Please retry at a later time.",@"Google Reader service") forKey:NSLocalizedRecoverySuggestionErrorKey];
+            
+            self.operationError = [NSError errorWithDomain:BSCommonsErrorDomain code:BSOperationError userInfo:errorInfo];
+        }
         return;
     }
     
-    // TODO: parse JSON data and package into the result dictionaries
     NSArray* subscriptions = [listData objectForKey:@"subscriptions"];
     if (![subscriptions isKindOfClass:ARRAY_CLASS]) {
         // JSON parse error.
+        NSString* localizedFailureReason = [NSString localizedStringWithFormat:@"Google Reader doesn't return an array for its \"subscriptions\" value but instead returned %@",[subscriptions class]];
+        ErrorLog(@"%@",localizedFailureReason);
+        NSMutableDictionary* errorInfo = [NSMutableDictionary dictionaryWithCapacity:3];
+        
+        [errorInfo setObject:NSLocalizedString(@"Unknown data returned from Google Reader",@"Google Reader service") forKey:NSLocalizedDescriptionKey];
+        [errorInfo setObject:localizedFailureReason forKey:NSLocalizedFailureReasonErrorKey];
+        [errorInfo setObject:NSLocalizedString(@"Please retry at a later time.",@"Google Reader service") forKey:NSLocalizedRecoverySuggestionErrorKey];
+        
+        self.operationError = [NSError errorWithDomain:BSCommonsErrorDomain code:BSOperationError userInfo:errorInfo];
+        
         return;
     }
     
     const NSUInteger subscriptionsCount = subscriptions.count;
     if (subscriptionsCount == 0) {
-        // no data
+        NSMutableDictionary* errorInfo = [NSMutableDictionary dictionaryWithCapacity:3];
+        
+        [errorInfo setObject:NSLocalizedString(@"No data returned from Google Reader",@"Google Reader service") forKey:NSLocalizedDescriptionKey];
+        [errorInfo setObject:NSLocalizedString(@"You probably do not have any feed configured in Google Reader",@"Google Reader service") forKey:NSLocalizedFailureReasonErrorKey];
+        [errorInfo setObject:NSLocalizedString(@"You do not need to import any feeds at this time.",@"Google Reader service") forKey:NSLocalizedRecoverySuggestionErrorKey];
+        self.operationError = [NSError errorWithDomain:BSCommonsErrorDomain code:BSOperationError userInfo:errorInfo];
         return;
     }
     

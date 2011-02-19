@@ -33,6 +33,7 @@ enum  {
 	BSOperationError	= 0x1001,
 	BSProcessLaunchError = 0x1002,
 	BSProcessReturnError = 0x1003,
+    BSInvalidCredentialsError = 0x1004,
 	
 	// I/O errors start at 0x1100
 	
